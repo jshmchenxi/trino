@@ -94,8 +94,9 @@ with Parquet files performed by supported object storage connectors:
   - `true`
 * - `parquet.use-column-index`
   - Skip reading Parquet pages by using Parquet column indices. The equivalent
-    catalog session property is `parquet_use_column_index`. Only supported by
-    the Delta Lake and Hive connectors.
+    catalog session property is `parquet_use_column_index`. Supported by the
+    Delta Lake, Hive, and Iceberg connectors. Iceberg disables page skipping for
+    splits that read `$row_position`, `$row_id`, or MERGE row id.
   - `true`
 * - `parquet.ignore-statistics`
   - Ignore statistics from Parquet to allow querying files with corrupted or

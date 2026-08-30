@@ -177,6 +177,7 @@ import static io.trino.parquet.ParquetTypeUtils.getColumnIO;
 import static io.trino.parquet.ParquetTypeUtils.getDescriptors;
 import static io.trino.parquet.predicate.PredicateUtils.buildPredicate;
 import static io.trino.parquet.predicate.PredicateUtils.getFilteredRowGroups;
+import static io.trino.parquet.reader.ParquetReader.getPrimitiveFields;
 import static io.trino.plugin.hive.parquet.ParquetPageSourceFactory.createDataSource;
 import static io.trino.plugin.iceberg.ColumnIdentity.TypeCategory.PRIMITIVE;
 import static io.trino.plugin.iceberg.GeoSpatialUtils.isGeospatialType;
@@ -199,6 +200,7 @@ import static io.trino.plugin.iceberg.IcebergSessionProperties.getParquetSmallFi
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isOrcBloomFiltersEnabled;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isOrcNestedLazy;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetIgnoreStatistics;
+import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetUseColumnIndex;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetVectorizedDecodingEnabled;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isUseFileSizeFromMetadata;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.useParquetBloomFilter;
@@ -681,10 +683,10 @@ public class IcebergPageSourceProvider
                             .withSmallFileThreshold(getParquetSmallFileThreshold(session))
                             .withIgnoreStatistics(isParquetIgnoreStatistics(session))
                             .withBloomFilter(useParquetBloomFilter(session))
-                            // TODO https://github.com/trinodb/trino/issues/11000
-                            .withUseColumnIndex(false)
+                            .withUseColumnIndex(isParquetUseColumnIndex(session))
                             .withVectorizedDecodingEnabled(isParquetVectorizedDecodingEnabled(session))
                             .build(),
+                    session,
                     predicate,
                     fileFormatDataSourceStats,
                     parquetFooterCache,
@@ -1111,6 +1113,7 @@ public class IcebergPageSourceProvider
             Schema tableSchema,
             List<IcebergColumnHandle> columns,
             ParquetReaderOptions options,
+            ConnectorSession session,
             TupleDomain<IcebergColumnHandle> effectivePredicate,
             FileFormatDataSourceStats fileFormatDataSourceStats,
             ParquetFooterCache parquetFooterCache,
@@ -1149,7 +1152,6 @@ public class IcebergPageSourceProvider
             MessageType requestedSchema = getMessageType(columnsForRead, fileSchema.getName(), parquetIdToFieldName);
             Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, requestedSchema);
             TupleDomain<ColumnDescriptor> parquetTupleDomain = options.isIgnoreStatistics() ? TupleDomain.all() : getParquetTupleDomain(descriptorsByPath, effectivePredicate);
-            TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, UTC);
 
             MessageColumnIO messageColumnIO = getColumnIO(fileSchema, requestedSchema);
 
@@ -1263,6 +1265,14 @@ public class IcebergPageSourceProvider
                 }
             }
 
+            List<Column> parquetColumnFields = parquetColumnFieldsBuilder.build();
+            boolean useColumnIndex = isParquetUseColumnIndex(session) && !appendRowNumberColumn;
+            options = ParquetReaderOptions.builder(options)
+                    .withUseColumnIndex(useColumnIndex)
+                    .build();
+            parquetTupleDomain = filterToReadColumns(parquetTupleDomain, parquetColumnFields);
+            TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, UTC);
+
             List<RowGroupInfo> rowGroups = getFilteredRowGroups(
                     start,
                     length,
@@ -1278,7 +1288,7 @@ public class IcebergPageSourceProvider
             ParquetDataSourceId dataSourceId = dataSource.getId();
             ParquetReader parquetReader = new ParquetReader(
                     Optional.ofNullable(fileMetaData.getCreatedBy()),
-                    parquetColumnFieldsBuilder.build(),
+                    parquetColumnFields,
                     appendRowNumberColumn,
                     rowGroups,
                     dataSource,
@@ -1286,7 +1296,7 @@ public class IcebergPageSourceProvider
                     memoryContext,
                     options,
                     exception -> handleException(dataSourceId, exception),
-                    Optional.empty(),
+                    useColumnIndex ? Optional.of(parquetPredicate) : Optional.empty(),
                     Optional.empty(),
                     parquetMetadata.getDecryptionContext());
 
@@ -1807,6 +1817,23 @@ public class IcebergPageSourceProvider
             }
         });
         return TupleDomain.withColumnDomains(predicate.buildOrThrow());
+    }
+
+    @VisibleForTesting
+    static TupleDomain<ColumnDescriptor> filterToReadColumns(
+            TupleDomain<ColumnDescriptor> parquetTupleDomain,
+            List<Column> parquetColumnFields)
+    {
+        if (parquetTupleDomain.isAll() || parquetTupleDomain.isNone()) {
+            return parquetTupleDomain;
+        }
+        Set<ColumnPath> readPaths = getPrimitiveFields(parquetColumnFields.stream()
+                .map(Column::field)
+                .collect(toImmutableList())).stream()
+                .map(field -> ColumnPath.get(field.getDescriptor().getPath()))
+                .collect(toImmutableSet());
+        return parquetTupleDomain.filter((descriptor, _) ->
+                readPaths.contains(ColumnPath.get(descriptor.getPath())));
     }
 
     private static TrinoException handleException(OrcDataSourceId dataSourceId, Exception exception)

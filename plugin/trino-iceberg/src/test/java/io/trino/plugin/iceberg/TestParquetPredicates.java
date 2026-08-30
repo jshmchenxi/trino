@@ -15,6 +15,8 @@ package io.trino.plugin.iceberg;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import io.trino.parquet.Column;
+import io.trino.parquet.PrimitiveField;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.RowType;
@@ -30,6 +32,7 @@ import java.util.Map;
 import static io.trino.parquet.ParquetTypeUtils.getDescriptors;
 import static io.trino.plugin.iceberg.ColumnIdentity.TypeCategory.PRIMITIVE;
 import static io.trino.plugin.iceberg.ColumnIdentity.TypeCategory.STRUCT;
+import static io.trino.plugin.iceberg.IcebergPageSourceProvider.filterToReadColumns;
 import static io.trino.plugin.iceberg.IcebergPageSourceProvider.getParquetTupleDomain;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static io.trino.spi.type.IntegerType.INTEGER;
@@ -212,5 +215,35 @@ public class TestParquetPredicates
         TupleDomain<ColumnDescriptor> calculatedTupleDomain = getParquetTupleDomain(descriptorsByPath, tupleDomain);
 
         assertThat(calculatedTupleDomain.isAll()).isTrue();
+    }
+
+    @Test
+    public void testFilterToReadColumnsDropsUnreadPredicate()
+    {
+        PrimitiveType typeA = new PrimitiveType(OPTIONAL, INT32, "a").withId(1);
+        PrimitiveType typeB = new PrimitiveType(OPTIONAL, INT32, "b").withId(2);
+        ColumnDescriptor descriptorA = new ColumnDescriptor(new String[] {"a"}, typeA, 0, 1);
+        ColumnDescriptor descriptorB = new ColumnDescriptor(new String[] {"b"}, typeB, 0, 1);
+        TupleDomain<ColumnDescriptor> tupleDomain = withColumnDomains(ImmutableMap.of(
+                descriptorA, Domain.singleValue(INTEGER, 1L),
+                descriptorB, Domain.singleValue(INTEGER, 2L)));
+
+        List<Column> readColumns = ImmutableList.of(
+                new Column("a", new PrimitiveField(INTEGER, false, descriptorA, 0)));
+
+        TupleDomain<ColumnDescriptor> filtered = filterToReadColumns(tupleDomain, readColumns);
+        assertThat(filtered.getDomains().orElseThrow()).containsOnlyKeys(descriptorA);
+        assertThat(filtered.getDomains().orElseThrow().get(descriptorA)).isEqualTo(Domain.singleValue(INTEGER, 1L));
+    }
+
+    @Test
+    public void testFilterToReadColumnsEmptyReadListBecomesAll()
+    {
+        PrimitiveType typeA = new PrimitiveType(OPTIONAL, INT32, "a").withId(1);
+        ColumnDescriptor descriptorA = new ColumnDescriptor(new String[] {"a"}, typeA, 0, 1);
+        TupleDomain<ColumnDescriptor> tupleDomain = withColumnDomains(ImmutableMap.of(
+                descriptorA, Domain.singleValue(INTEGER, 1L)));
+
+        assertThat(filterToReadColumns(tupleDomain, ImmutableList.of()).isAll()).isTrue();
     }
 }

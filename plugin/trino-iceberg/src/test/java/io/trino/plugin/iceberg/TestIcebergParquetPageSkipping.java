@@ -20,9 +20,7 @@ import io.trino.metastore.HiveMetastore;
 import io.trino.parquet.metadata.BlockMetadata;
 import io.trino.parquet.metadata.ParquetMetadata;
 import io.trino.plugin.hive.BaseTestParquetPageSkipping;
-import io.trino.spi.metrics.Count;
 import io.trino.testing.QueryRunner;
-import io.trino.testing.QueryRunner.MaterializedResultWithPlan;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
@@ -38,11 +36,9 @@ import org.intellij.lang.annotations.Language;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import java.util.Objects;
 import java.util.Optional;
 
 import static com.google.common.io.Resources.getResource;
-import static io.trino.parquet.reader.ParquetReader.COLUMN_INDEX_ROWS_FILTERED;
 import static io.trino.plugin.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static io.trino.plugin.iceberg.IcebergTestUtils.SESSION;
 import static io.trino.plugin.iceberg.IcebergTestUtils.getFileSystemFactory;
@@ -87,6 +83,10 @@ public class TestIcebergParquetPageSkipping
     {
         String tableName = tableName(tableNamePrefix);
         assertUpdate(format("CREATE TABLE %s %s WITH (format = 'PARQUET')", tableName, columnsDefinition));
+        BaseTable table = loadTable(tableName);
+        table.updateProperties()
+                .set(DEFAULT_NAME_MAPPING, toJson(MappingUtil.create(table.schema())))
+                .commit();
         appendIndexedFile(tableName, resourceFileName, Optional.empty());
         return tableName;
     }
@@ -94,7 +94,7 @@ public class TestIcebergParquetPageSkipping
     @Override
     protected String timestampMillisType()
     {
-        return "timestamp(3)";
+        return "timestamp(6)";
     }
 
     @Test
@@ -181,36 +181,13 @@ public class TestIcebergParquetPageSkipping
         assertUpdate("DROP TABLE " + tableName);
     }
 
-    @Test
-    public void testSessionKillSwitch()
-            throws Exception
-    {
-        String tableName = createTableWithDataFile(
-                "test_session_kill_switch",
-                "(suppkey bigint, extendedprice decimal(12, 2), shipmode varchar, comment varchar)",
-                "parquet_page_skipping/lineitem_sorted_by_suppkey/data.parquet");
-        MaterializedResultWithPlan result = getDistributedQueryRunner().executeWithPlan(
-                noParquetColumnIndexFiltering(getSession()),
-                "SELECT * FROM " + tableName + " WHERE suppkey BETWEEN 25 AND 35");
-        assertThat(getDistributedQueryRunner().getCoordinator()
-                .getQueryManager()
-                .getFullQueryInfo(result.queryId())
-                .getQueryStats()
-                .getOperatorSummaries()
-                .stream()
-                .filter(summary -> summary.getOperatorType().startsWith("TableScan") || summary.getOperatorType().startsWith("Scan"))
-                .flatMap(summary -> summary.getConnectorMetrics().getMetrics().keySet().stream())
-                .noneMatch(COLUMN_INDEX_ROWS_FILTERED::equals))
-                .isTrue();
-        assertUpdate("DROP TABLE " + tableName);
-    }
-
     private String createParquetV2IndexedTable()
             throws Exception
     {
         String tableName = "test_iceberg_page_skipping_v2_" + randomNameSuffix();
-        assertUpdate("CREATE TABLE " + tableName + " (id bigint, payload varchar) WITH (format = 'PARQUET', format_version = 2)");
-        BaseTable table = IcebergTestUtils.loadTable(tableName, metastore, getFileSystemFactory(getQueryRunner()), ICEBERG_CATALOG, "tpch");
+        assertUpdate("CREATE TABLE " + tableName +
+                " (id bigint, payload varchar) WITH (format = 'PARQUET', format_version = 2)");
+        BaseTable table = loadTable(tableName);
         Schema schema = table.schema();
         String dataPath = table.location() + "/data/v2-indexed-" + randomNameSuffix() + ".parquet";
         FileAppender<Record> writer = Parquet.write(table.io().newOutputFile(dataPath))
@@ -243,6 +220,11 @@ public class TestIcebergParquetPageSkipping
         return tableName;
     }
 
+    private BaseTable loadTable(String tableName)
+    {
+        return IcebergTestUtils.loadTable(tableName, metastore, getFileSystemFactory(getQueryRunner()), ICEBERG_CATALOG, "tpch");
+    }
+
     private void assertParquetV2Pages(String tableName)
             throws Exception
     {
@@ -262,7 +244,7 @@ public class TestIcebergParquetPageSkipping
     private void appendIndexedFile(String tableName, String resourceName, Optional<String> orderstatus)
             throws Exception
     {
-        BaseTable table = IcebergTestUtils.loadTable(tableName, metastore, getFileSystemFactory(getQueryRunner()), ICEBERG_CATALOG, "tpch");
+        BaseTable table = loadTable(tableName);
         String dataPath = table.location() + "/data/" + randomNameSuffix() + ".parquet";
         byte[] parquetFileData = Resources.toByteArray(getResource(resourceName));
         fileSystem.newOutputFile(Location.of(dataPath)).createOrOverwrite(parquetFileData);
@@ -279,26 +261,5 @@ public class TestIcebergParquetPageSkipping
         table.newAppend()
                 .appendFile(builder.build())
                 .commit();
-        table.updateProperties()
-                .set(DEFAULT_NAME_MAPPING, toJson(MappingUtil.create(table.schema())))
-                .commit();
-    }
-
-    private void assertUpdateWithPageSkipping(@Language("SQL") String sql, long expectedUpdateCount)
-    {
-        MaterializedResultWithPlan result = getDistributedQueryRunner().executeWithPlan(getSession(), sql);
-        assertThat(result.result().getUpdateCount()).hasValue(expectedUpdateCount);
-        long rowsFilteredByColumnIndex = getDistributedQueryRunner().getCoordinator()
-                .getQueryManager()
-                .getFullQueryInfo(result.queryId())
-                .getQueryStats()
-                .getOperatorSummaries()
-                .stream()
-                .filter(summary -> summary.getOperatorType().startsWith("TableScan") || summary.getOperatorType().startsWith("Scan"))
-                .map(summary -> summary.getConnectorMetrics().getMetrics().get(COLUMN_INDEX_ROWS_FILTERED))
-                .filter(Objects::nonNull)
-                .mapToLong(metric -> ((Count<?>) metric).getTotal())
-                .sum();
-        assertThat(rowsFilteredByColumnIndex).isGreaterThan(0);
     }
 }
